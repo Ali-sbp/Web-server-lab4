@@ -1,0 +1,7 @@
+/build/
+/webserver
+*.log
+/www/uploads/*
+!/www/uploads/.gitkeep
+.DS_Store
+README.md

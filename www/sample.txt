@@ -1,0 +1,2 @@
+Hello from UNIX Lab 4!
+This static text file is served by a forked child process.
