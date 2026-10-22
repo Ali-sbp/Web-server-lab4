@@ -128,8 +128,7 @@ static int is_token(const char *text)
 }
 
 /* Parse in place: replace separators with '\0' to create individual C strings.
-   Fill request for the dispatcher; return 0 on success or an HTTP error status.
-   This private helper is called only inside this file. */
+   Fill request for the dispatcher; return 0 on success or an HTTP error status. */
 static int parse_headers(char *buffer, struct http_request *request)
 {
     /* 1. Isolate the request line, for example "GET /sample.txt HTTP/1.1". */

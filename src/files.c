@@ -13,14 +13,16 @@ int files_open(struct files_context *files, const char *root,
                 struct logger *log)
 {
     *files = (struct files_context){.root_fd = -1, .uploads_fd = -1};
-    /* 1. Retain directory descriptors so daemon chdir() cannot break paths. */
+    /* 1. Called once by main(); children later inherit these directory descriptors.
+       Open relative to them so daemon chdir() cannot break file access. */
     files->root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (files->root_fd == -1)
         goto failure;
 
-    /* Directory descriptor, child name, permissions for a new directory. */
+    // Directory descriptor, child name, permissions for a new directory.
     if (mkdirat(files->root_fd, "uploads", 0750) == -1 && errno != EEXIST)
         goto failure;
+    // Uploads are stored inside the root and served through /uploads/<filename>.
     files->uploads_fd = openat(files->root_fd, "uploads",
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (files->uploads_fd == -1)
@@ -36,6 +38,7 @@ failure:
 
 void files_close(struct files_context *files)
 {
+    // Release this process's directory handles; no files or directories are deleted.
     if (files->uploads_fd != -1)
         close(files->uploads_fd);
     if (files->root_fd != -1)
@@ -51,13 +54,66 @@ static int hex_digit(unsigned char c)
     return -1;
 }
 
+// Resolve decoded path components in place, using '/' as the site's root.
+static int normalize_path(char *path)
+{
+    size_t input = 1, output = 1;
+    int trailing_slash = 0;
+
+    while (path[input] != '\0') {
+        if (path[input] == '/') {
+            ++input;
+            continue;
+        }
+
+        // Read one component, e.g. '123', '..', or 'index.html'.
+        size_t start = input;
+        while (path[input] != '\0' && path[input] != '/')
+            ++input;
+        size_t length = input - start;
+        trailing_slash = path[input] == '/';
+
+        if (length == 1 && path[start] == '.') {
+            trailing_slash = 1;  // '.' stays in the current directory.
+            continue;
+        }
+        if (length == 2 && path[start] == '.' && path[start + 1] == '.') {
+            // '..' removes the previous component, but cannot go above the root.
+            if (output == 1)
+                return 403;
+            while (output > 1 && path[output - 1] != '/')
+                --output;
+            if (output > 1)
+                --output;
+            trailing_slash = 1;
+            continue;
+        }
+
+        // Ordinary hidden names remain forbidden; '.' and '..' were handled above.
+        if (path[start] == '.')
+            return 403;
+        if (output > 1)
+            path[output++] = '/';
+        memmove(path + output, path + start, length);
+        output += length;
+    }
+
+    // Keep directory semantics: /folder/. becomes /folder/, not a file URL.
+    if (trailing_slash && output > 1)
+        path[output++] = '/';
+    path[output] = '\0';
+    return 0;
+}
+
 int files_decode_path(const char *target, char *path, size_t capacity)
 {
-    /* 2. Decode URL escapes once; a query string is not part of the filename. */
+    /* 2. Called by the HTTP parser to turn the URL target into a filesystem path.
+       Decode escapes once and stop before '?'; query text is not a filename. */
     size_t used = 0;
     for (size_t i = 0; target[i] != '\0' && target[i] != '?'; ++i) {
         unsigned char c = (unsigned char)target[i];
         if (c == '%') {
+            // Combine the two hexadecimal digits after '%', e.g. %20 becomes a space.
             if (target[i + 1] == '\0' || target[i + 2] == '\0')
                 return 400;
             int high = hex_digit((unsigned char)target[i + 1]);
@@ -67,6 +123,7 @@ int files_decode_path(const char *target, char *path, size_t capacity)
             c = (unsigned char)(high * 16 + low);
             i += 2;
         }
+        // Reject null/control bytes and characters we do not allow in file paths.
         if (c < 32 || c == 127 || c == '\\' || c == '#')
             return 400;
         if (used + 1 >= capacity)
@@ -77,14 +134,11 @@ int files_decode_path(const char *target, char *path, size_t capacity)
     if (used == 0 || path[0] != '/')
         return 400;
 
-    /* Hide dotfiles, including temporary uploads, and reject traversal. */
-    for (const char *p = path; *p; ++p) {
-        if (*p == '/' && p[1] == '.')
-            return 403;
-    }
-    return 0;
+    // Normalize after decoding, so encoded dots/slashes follow the same root checks.
+    return normalize_path(path);
 }
 
+// Translate filesystem failures into an HTTP status, e.g. a missing file is 404.
 static int filesystem_status(int error)
 {
     switch (error) {
@@ -103,6 +157,7 @@ static int fail_request(int sock, int status, int head_only,
     return status;
 }
 
+// Describe the file by its extension; the file bytes themselves are not converted.
 static const char *content_type(const char *path)
 {
     const char *extension = strrchr(path, '.');
@@ -124,6 +179,7 @@ static const char *content_type(const char *path)
 
 static int open_static(int root_fd, const char *path)
 {
+    // Map '/' to index.html; other paths lose their leading '/' for relative openat().
     char relative[MAX_TARGET_SIZE];
     if (strcmp(path, "/") == 0)
         strcpy(relative, "index.html");
@@ -132,11 +188,13 @@ static int open_static(int root_fd, const char *path)
 
     /* 3. Walk beneath the root one component at a time.
        O_NOFOLLOW rejects symlinks, including those in parent directories. */
+    // Work with a copy so closing intermediate directories preserves the root handle.
     int directory = dup(root_fd);
     if (directory == -1)
         return -1;
     char *component = relative;
     for (;;) {
+        // For /uploads/photo.png, open uploads first, then photo.png beneath it.
         char *slash = strchr(component, '/');
         if (slash != NULL)
             *slash = '\0';
@@ -145,14 +203,16 @@ static int open_static(int root_fd, const char *path)
             errno = EACCES;
             return -1;
         }
+        // Avoid blocking on special files; files_serve() later requires a regular file.
         int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
         if (slash != NULL)
             flags |= O_DIRECTORY;
-        /* Parent directory, component name, open flags. */
+        // Parent directory, component name, open flags.
         int next = openat(directory, component, flags);
         int error = errno;
         close(directory);
         errno = error;
+        // Return the final file descriptor, or an error from any failed component.
         if (next == -1 || slash == NULL)
             return next;
         directory = next;
@@ -163,6 +223,7 @@ static int open_static(int root_fd, const char *path)
 int files_serve(int sock, struct files_context *files,
                 const struct http_request *request, struct logger *log)
 {
+    // GET/HEAD start here after HTTP parsing; /sample.txt opens beneath the root.
     int fd = open_static(files->root_fd, request->path);
     if (fd == -1) {
         int error = errno;
@@ -170,18 +231,20 @@ int files_serve(int sock, struct files_context *files,
         return fail_request(sock, filesystem_status(error), request->head_only, log);
     }
 
+    // Obtain the file type and byte size needed for validation and Content-Length.
     struct stat info;
     if (fstat(fd, &info) == -1) {
         logger_write(log, "ERROR", "fstat %s: %s", request->path, strerror(errno));
         close(fd);
         return fail_request(sock, 500, request->head_only, log);
     }
+    // Directories and special files are rejected; we do not generate listings.
     if (!S_ISREG(info.st_mode) || info.st_size < 0) {
         close(fd);
         return fail_request(sock, 403, request->head_only, log);
     }
 
-    /* 4. GET and HEAD share headers; HEAD deliberately omits file bytes. */
+    // 4. Send status 200, the content type, and the file's size before any file data.
     const char *name = strcmp(request->path, "/") == 0 ? "index.html" : request->path;
     if (http_send_headers(sock, 200, content_type(name),
                           (uintmax_t)info.st_size, NULL) == -1) {
@@ -190,13 +253,15 @@ int files_serve(int sock, struct files_context *files,
         return 200;
     }
 
+    // HEAD ends after the headers; only GET enters the file-to-socket loop.
     if (!request->head_only) {
         char buffer[16384];
         off_t remaining = info.st_size;
         while (remaining > 0) {
+            // Read up to 16 KiB, without exceeding the size advertised in the headers.
             size_t amount = remaining < (off_t)sizeof(buffer)
                             ? (size_t)remaining : sizeof(buffer);
-            /* File descriptor, destination buffer, maximum byte count. */
+            // File -> memory: file descriptor, destination buffer, maximum byte count.
             ssize_t n = read(fd, buffer, amount);
             if (n == -1 && errno == EINTR)
                 continue;
@@ -205,15 +270,16 @@ int files_serve(int sock, struct files_context *files,
                              n == 0 ? "file shortened during transfer" : strerror(errno));
                 break;
             }
+            // Memory -> client: send exactly the bytes read, including any binary zeros.
             if (http_send_all(sock, buffer, (size_t)n) == -1) {
                 logger_write(log, "ERROR", "sending %s: %s", request->path, strerror(errno));
                 break;
             }
-            remaining -= n;
+            remaining -= n;  // Continue until the advertised body has been sent.
         }
     }
     close(fd);
-    return 200;
+    return 200;  // Return the selected HTTP status for the access log.
 }
 
 static int valid_upload_name(const char *name)
@@ -229,6 +295,7 @@ static int valid_upload_name(const char *name)
     return 1;
 }
 
+// Like socket sends, disk writes may be partial; finish this whole buffer or fail.
 static int write_all(int fd, const char *data, size_t size)
 {
     size_t written = 0;
@@ -249,13 +316,15 @@ static int write_all(int fd, const char *data, size_t size)
 int files_upload(int sock, struct files_context *files,
                  const struct http_request *request, struct logger *log)
 {
-    /* 5. POST accepts a raw file body at /upload/<simple-filename>. */
+    // 5. POST accepts a raw file body at /upload/<simple-filename>.
     if (strncmp(request->path, "/upload/", 8) != 0)
         return fail_request(sock, 404, 0, log);
+    // Skip '/upload/' to get the destination filename, then validate that name.
     const char *name = request->path + 8;
     if (!valid_upload_name(name))
         return fail_request(sock, 400, 0, log);
 
+    // Reject an existing name before asking the client to send the upload body.
     struct stat existing;
     if (fstatat(files->uploads_fd, name, &existing, AT_SYMLINK_NOFOLLOW) == 0)
         return fail_request(sock, 409, 0, log);
@@ -264,13 +333,13 @@ int files_upload(int sock, struct files_context *files,
         return fail_request(sock, 500, 0, log);
     }
 
-    /* 6. Receive into a hidden file; incomplete data is never downloadable. */
+    // 6. Receive into a hidden file; incomplete data is never downloadable.
     char temporary[64];
     int fd = -1;
     for (unsigned int attempt = 0; attempt < 100; ++attempt) {
         snprintf(temporary, sizeof(temporary), ".upload-%ld-%u",
                  (long)getpid(), attempt);
-        /* Directory, temporary name, exclusive creation flags, permissions. */
+        // Directory, temporary name, exclusive creation flags, permissions.
         fd = openat(files->uploads_fd, temporary,
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd != -1 || errno != EEXIST)
@@ -282,7 +351,7 @@ int files_upload(int sock, struct files_context *files,
     }
 
     int status = 201;
-    /* curl may wait for permission before transmitting a larger body. */
+    // curl may wait for permission before transmitting a larger body.
     if (request->expect_continue && request->body_size < request->content_length) {
         const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
         if (http_send_all(sock, interim, sizeof(interim) - 1) == -1) {
@@ -292,6 +361,8 @@ int files_upload(int sock, struct files_context *files,
         }
     }
 
+    /* The HTTP reader may already have received file bytes along with the headers.
+       Write those bytes first; do not read them from the socket a second time. */
     size_t received = request->body_size < request->content_length
                       ? request->body_size : request->content_length;
     if (write_all(fd, request->body, received) == -1) {
@@ -300,21 +371,24 @@ int files_upload(int sock, struct files_context *files,
         goto cleanup;
     }
 
+    // Receive the rest of the body until exactly Content-Length bytes are written.
     char buffer[16384];
     while (received < request->content_length) {
         size_t remaining = request->content_length - received;
         size_t amount = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        /* Socket, file-data buffer, bytes still needed, no flags. */
+        // Client -> memory: socket, file-data buffer, bytes still needed, no flags.
         ssize_t n = recv(sock, buffer, amount, 0);
         if (n == -1 && errno == EINTR)
             continue;
         if (n <= 0) {
+            // A disconnect before the full length is incomplete; inactivity means 408.
             status = n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)
                      ? 408 : 400;
             logger_write(log, "ERROR", "incomplete upload %s: %s", name,
                          n == 0 ? "client disconnected" : strerror(errno));
             goto cleanup;
         }
+        // Memory -> temporary file: preserve the actual byte count, not a string length.
         if (write_all(fd, buffer, (size_t)n) == -1) {
             logger_write(log, "ERROR", "writing upload %s: %s", name, strerror(errno));
             status = 500;
@@ -323,6 +397,7 @@ int files_upload(int sock, struct files_context *files,
         received += (size_t)n;
     }
 
+    // Finish writing before making the completed file visible under its final name.
     if (close(fd) == -1) {
         fd = -1;
         logger_write(log, "ERROR", "closing upload %s: %s", name, strerror(errno));
@@ -341,6 +416,8 @@ int files_upload(int sock, struct files_context *files,
     }
 
 cleanup:
+    /* On failure, remove the incomplete file. On success, remove only the temporary
+       name: the final name created by linkat() still refers to the completed file. */
     if (fd != -1)
         close(fd);
     if (unlinkat(files->uploads_fd, temporary, 0) == -1)
@@ -348,7 +425,7 @@ cleanup:
     if (status != 201)
         return fail_request(sock, status, 0, log);
 
-    /* 8. Return the URL where the completed upload can be downloaded. */
+    // 8. Return 201 and Location: /uploads/<filename> for the completed file.
     char extra[320], body[320];
     snprintf(extra, sizeof(extra), "Location: /uploads/%s\r\n", name);
     int length = snprintf(body, sizeof(body), "Uploaded: /uploads/%s\n", name);
