@@ -22,7 +22,7 @@ int files_open(struct files_context *files, const char *root,
     // Directory descriptor, child name, permissions for a new directory.
     if (mkdirat(files->root_fd, "uploads", 0750) == -1 && errno != EEXIST)
         goto failure;
-    // Uploads are stored inside the root and served through /uploads/<filename>.
+    // uploads are stored inside the root and served through /uploads/<filename>.
     files->uploads_fd = openat(files->root_fd, "uploads",
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (files->uploads_fd == -1)
@@ -38,7 +38,7 @@ failure:
 
 void files_close(struct files_context *files)
 {
-    // Release this process's directory handles; no files or directories are deleted.
+    // release this process's directory handles; no files or directories are deleted.
     if (files->uploads_fd != -1)
         close(files->uploads_fd);
     if (files->root_fd != -1)
@@ -54,7 +54,7 @@ static int hex_digit(unsigned char c)
     return -1;
 }
 
-// Resolve decoded path components in place, using '/' as the site's root.
+// resolve decoded path components in place, using '/' as the site's root.
 static int normalize_path(char *path)
 {
     size_t input = 1, output = 1;
@@ -66,7 +66,7 @@ static int normalize_path(char *path)
             continue;
         }
 
-        // Read one component, e.g. '123', '..', or 'index.html'.
+        // read one component, for example:  '123', '..', or 'index.html'.
         size_t start = input;
         while (path[input] != '\0' && path[input] != '/')
             ++input;
@@ -89,7 +89,7 @@ static int normalize_path(char *path)
             continue;
         }
 
-        // Ordinary hidden names remain forbidden; '.' and '..' were handled above.
+        // ordinary hidden names remain forbidden; '.' and '..' were handled above.
         if (path[start] == '.')
             return 403;
         if (output > 1)
@@ -98,7 +98,7 @@ static int normalize_path(char *path)
         output += length;
     }
 
-    // Keep directory semantics: /folder/. becomes /folder/, not a file URL.
+    // keep directory semantics: /folder/. becomes /folder/, not a file URL.
     if (trailing_slash && output > 1)
         path[output++] = '/';
     path[output] = '\0';
@@ -123,7 +123,7 @@ int files_decode_path(const char *target, char *path, size_t capacity)
             c = (unsigned char)(high * 16 + low);
             i += 2;
         }
-        // Reject null/control bytes and characters we do not allow in file paths.
+        // reject null/control bytes and characters we do not allow in file paths.
         if (c < 32 || c == 127 || c == '\\' || c == '#')
             return 400;
         if (used + 1 >= capacity)
@@ -133,6 +133,13 @@ int files_decode_path(const char *target, char *path, size_t capacity)
     path[used] = '\0';
     if (used == 0 || path[0] != '/')
         return 400;
+
+    // before : 
+    // for (const char *p = path; *p; ++p) {
+    //     if (*p == '/' && p[1] == '.')
+    //         return 403;
+    // }
+    // return 0;
 
     // Normalize after decoding, so encoded dots/slashes follow the same root checks.
     return normalize_path(path);
